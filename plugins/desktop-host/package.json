@@ -1,0 +1,31 @@
+{
+  "name": "@titxue/dsh-desktop-host",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 桌面发行版宿主插件：桌面壳 ↔ dsh 进程的本地 IPC 桥（就绪状态、托盘、生命周期）",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types test/bridge.smoke.ts"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "typescript": "^5.6.0"
+  }
+}

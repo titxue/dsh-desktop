@@ -1,6 +1,9 @@
 # --- Dependencies ---
 node_modules/
 
+# --- 插件构建产物 ---
+plugins/desktop-host/lib/
+
 # --- Rust / Tauri build artifacts ---
 src-tauri/target/
 src-tauri/gen/schemas/

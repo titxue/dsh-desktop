@@ -12,6 +12,10 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tauri::Url;
 
+/// 桌面壳 ↔ dsh 进程的通用 IPC 桥（Windows 管道 / POSIX unix socket）。
+/// 接入点：M1 桥客户端线程消费事件、发送命令（见 docs/design-desktop-host.md）。
+pub mod bridge;
+
 /// CREATE_NO_WINDOW: keep the server and npm consoles hidden.
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 

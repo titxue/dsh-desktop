@@ -1,0 +1,14 @@
+{
+  "name": "dsh-desktop",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "setup:runtime": "bun scripts/setup-runtime.ts",
+    "tauri:dev": "bunx tauri dev",
+    "tauri:build": "bunx tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  }
+}

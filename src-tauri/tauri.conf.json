@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepSeek Harness",
+  "version": "0.1.0",
+  "identifier": "ai.deepseek.harness.desktop",
+  "build": {
+    "beforeDevCommand": "",
+    "devUrl": "http://localhost:3080",
+    "beforeBuildCommand": "",
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": [
+      "../bootstrap"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "DeepSeek Harness desktop app",
+    "longDescription": "DeepSeek Harness — the agent harness for coding agents — packaged as a desktop application."
+  },
+  "mainBinaryName": "DeepSeek Harness"
+}

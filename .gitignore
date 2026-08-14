@@ -1,0 +1,28 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Rust / Tauri build artifacts ---
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# --- Generated runtime bundles (bun scripts/setup-runtime.ts --bundle) ---
+runtime/
+runtime-pruned/
+.prune-roots/
+.tmp-node.zip
+.tmp-lock/
+
+# --- Local scratch / test homes ---
+dump-home/
+e2e-home/
+prune-home/
+test-home/
+
+# --- Logs & screenshots ---
+*.log
+*.png.bak
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini

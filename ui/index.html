@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>DeepSeek Harness</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1020; color: #dbe2f5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center; }
+  .wrap { text-align: center; width: min(460px, 80vw); }
+  .logo { font-size: 34px; font-weight: 700; letter-spacing: 1px;
+    background: linear-gradient(135deg, #4d7cfe, #8b5cf6);
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .sub { margin-top: 10px; font-size: 13px; opacity: .6; }
+  .track { margin: 28px auto 0; width: 100%; height: 6px; border-radius: 3px;
+    background: rgba(255,255,255,.1); overflow: hidden; }
+  .fill { height: 100%; width: 0%; border-radius: 3px;
+    background: linear-gradient(90deg, #4d7cfe, #8b5cf6);
+    transition: width .25s ease; }
+  .pct { margin-top: 10px; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .label { margin-top: 6px; font-size: 13px; opacity: .85; min-height: 18px; }
+  .detail { margin-top: 4px; font-size: 12px; opacity: .45; min-height: 16px;
+    font-family: ui-monospace, Consolas, monospace; }
+  .indeterminate .fill { width: 30% !important; animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(380%); } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo">DeepSeek Harness</div>
+    <div class="sub">首次启动需要下载运行时与依赖，请保持网络连接</div>
+    <div class="track" id="track"><div class="fill" id="fill"></div></div>
+    <div class="pct" id="pct">—</div>
+    <div class="label" id="label">准备中…</div>
+    <div class="detail" id="detail"></div>
+  </div>
+<script>
+  // Called by the native shell (window.eval) whenever bootstrap progress changes.
+  window.updateProgress = function (state) {
+    var track = document.getElementById('track');
+    var fill = document.getElementById('fill');
+    var pct = document.getElementById('pct');
+    var label = document.getElementById('label');
+    var detail = document.getElementById('detail');
+    if (!track) return;
+    if (state.phase === 'error') {
+      track.className = 'track indeterminate';
+      pct.textContent = '启动失败';
+      label.textContent = state.label || '发生错误';
+      detail.textContent = state.detail || '';
+      return;
+    }
+    if (state.pct === null || state.pct === undefined) {
+      track.className = 'track indeterminate';
+      pct.textContent = '…';
+    } else {
+      track.className = 'track';
+      fill.style.width = state.pct + '%';
+      pct.textContent = state.pct + '%';
+    }
+    if (state.label) label.textContent = state.label;
+    if (state.detail) detail.textContent = state.detail;
+  };
+</script>
+</body>
+</html>

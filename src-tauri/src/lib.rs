@@ -60,7 +60,11 @@ fn log_line(app: &tauri::AppHandle, line: &str) {
     if let Ok(dir) = app.path().app_log_dir() {
         let _ = create_dir_all(&dir);
         let _ = File::options().create(true).append(true).open(dir.join("desktop.log")).map(|mut f| {
-            let _ = writeln!(f, "{line}");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{now}] {line}");
         });
     }
 }
@@ -77,6 +81,14 @@ fn find_resource_subdir(resource_dir: &Path, exe_dir: &Path, name: &str) -> Opti
         }
     }
     None
+}
+
+/// Best-effort current URL of a window, for close-request diagnostics.
+fn window_url(app: &tauri::AppHandle, label: &str) -> String {
+    app.get_webview_window(label)
+        .and_then(|w| w.url().ok())
+        .map(|u| u.to_string())
+        .unwrap_or_default()
 }
 
 /// Ask the OS for a free TCP port, then release it for the server to bind.
@@ -493,10 +505,7 @@ pub fn run() {
                 .executable_dir()
                 .unwrap_or_else(|_| std::env::current_exe().map(|p| p.to_path_buf()).unwrap_or_default());
 
-            // Replay the latest progress state whenever the page (re)loads,
-            // e.g. after the initial WebView2 navigation has finished.
             let shared = Arc::new(Mutex::new(ProgressState::new("starting", "准备中…", None, "")));
-            let shared_on_load = shared.clone();
             let window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -505,12 +514,6 @@ pub fn run() {
             .title("DeepSeek Harness")
             .inner_size(1440.0, 900.0)
             .min_inner_size(960.0, 640.0)
-            .on_page_load(move |window, _payload| {
-                let state = shared_on_load.lock().map(|g| g.clone()).unwrap_or_else(|_| ProgressState::new("starting", "准备中…", None, ""));
-                if let Ok(json) = serde_json::to_string(&state) {
-                    let _ = window.eval(&format!("window.updateProgress?.({json})"));
-                }
-            })
             .build()?;
 
             let handle = app.handle().clone();
@@ -536,10 +539,9 @@ pub fn run() {
                 }
             }
             tauri::RunEvent::WindowEvent { label, event, .. } => match event {
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    log_line(&app_handle, &format!("window {label}: CloseRequested api={api:?}"));
-                    api.prevent_close();
-                    log_line(&app_handle, "window close prevented (experiment)");
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    let url = window_url(&app_handle, &label);
+                    log_line(&app_handle, &format!("window {label}: CloseRequested url={url}"));
                 }
                 tauri::WindowEvent::Destroyed => {
                     log_line(&app_handle, &format!("window {label}: Destroyed"));

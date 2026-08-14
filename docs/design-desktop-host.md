@@ -44,8 +44,15 @@
 - --patch <file> 可在内置 profile 上叠加自定义插件配置（可重复），**这是官方支持的扩展入口**；
 - 仓库根目录的 composed-web.yml 就是这种 profile 的格式（插件 id/name/config 列表）。
   → 发行版只需随资源附带 desktop.yml（= web 全量 + desktop-host 一项），壳以
-  --profile web --patch <绝对路径>/desktop.yml 启动。patch 合并语义（追加 vs 覆盖）
-  在 M1 实现时验证一次即可。
+  --profile web --patch <绝对路径>/desktop.yml 启动。
+
+**patch 合并语义（M1 已实测，cordis-plugin-include 源码 + dump-config 实证）**：
+- 默认是**覆盖**：patch 条目按 id 匹配已有条目，未匹配报 `entry not found`；
+- **追加新插件必须用 `insert:` 关键字**：`- insert: [{id, name, config}]` 把条目追加到
+  profile 顶层（无 id 时）；带 id 的 insert 会把条目插进 group 条目的 config 数组；
+- 验证命令：`dsh --profile web --patch <file> --dump-config`（打印合并结果，不启动服务）；
+- **模块解析起点是 DSH_HOME/profiles/<profile>/ 目录**（非进程 cwd）——插件包需出现在
+  profile 目录的 node_modules 解析链上（M4 组装要点）。
 
 ## 3. 桥协议 v1
 
@@ -97,12 +104,20 @@ POST 命令），方便开发者在浏览器里单独调试插件；生产构建
 ```
 plugins/desktop-host/
   package.json          name: @titxue/dsh-desktop-host  (发布到 npm)
-  src/index.ts          export const name; export function apply(ctx)
+  desktop.yml           组合叠加层：insert desktop-host 条目（随安装包发布）
+  src/index.ts          export const name/inject; export function apply(ctx)
   src/bridge.ts         本地 IPC 桥（Windows 管道 / POSIX unix socket，HTTP 调试通道可选）
-  src/lifecycle.ts      状态机 + 事件订阅
-  src/menu.ts           托盘菜单模型
-  src/progress.ts       引导进度转发（npm/服务器阶段的壳侧进度也经此归一）
+  src/lifecycle.ts      就绪检测（await ctx.webServer → 实际端口）
+  src/menu.ts           托盘菜单模型（M2）
+  src/progress.ts       引导进度转发（M2）
 ```
+
+**cordis 4 的两个关键约束（M1 实测踩坑）**：
+- 访问服务必须声明依赖：`export const inject = ["webServer"]`（否则
+  `cannot get property "webServer" without inject`）；依赖在组合层面注入，
+  无 webServer 的组合（tui）应移除该行；
+- **状态重放**：客户端（壳）可能在事件发出后才连接/重连，桥须在
+  `onClientConnect` 时补发最近一次 state（已实现）。
 
 apply(ctx) 核心（**完全符合 dshfind 教程定义**）：
 
@@ -209,7 +224,7 @@ desktop:
 
 | 里程碑 | 内容 | 验收标准 |
 |--------|------|----------|
-| **M1 桥 + 就绪事件** | 插件骨架（apply/ctx.effect/桥服务）；desktop.yml patch 验证；壳侧桥客户端；ready 事件驱动导航 | 安装版启动：日志出现 bridge 连接，窗口在服务就绪后自动导航；纯 web 模式不受影响 |
+| **M1 桥 + 就绪事件** ✅ 已完成 | 插件骨架（apply/ctx.effect/桥服务）；desktop.yml insert 语义验证；壳侧桥客户端（BridgeClient）+ lib.rs 接线（ready 驱动导航，wait_for_port 兜底）；状态重放 | 实测通过：`dsh --profile web --patch desktop.yml` 加载插件 → 桥 up → `state: ready {host, port}` 经命名管道送达 Rust 客户端（含重连重放）；纯 web 模式（无 token）不受影响 |
 | **M2 托盘** | 图标 4 态、菜单模型下发、显示/退出、通知 | 托盘全交互可用；关闭按钮最小化到托盘 |
 | **M3 生命周期增强** | 重启服务、优雅关闭、单实例、自启、设置项 | 重启秒级恢复；二次启动聚焦；退出不留孤儿进程 |
 | **M4 发布** | 插件发布 npm；bootstrap/package.json 加入固定版本；setup-runtime.ts 组装支持；**CI 三平台构建矩阵**（Windows NSIS / macOS DMG / Linux deb+AppImage）；node-manifest 多平台 SHA-256；README 更新 | 三平台安装包各自首启成功、托盘全功能；**仓库含真正插件 → dsh-plugin topic 名副其实** |

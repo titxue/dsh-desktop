@@ -421,6 +421,97 @@ fn show_error(window: &tauri::WebviewWindow, message: &str) {
     }
 }
 
+/// 生成桥 token：sha256(时间戳 + pid + 计数器)。端点名即认证，仅防本机
+/// 其他进程猜测；非密码学级随机但足够（管道名不可枚举）。
+fn make_token() -> String {
+    use sha2::{Digest, Sha256};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = Sha256::new();
+    hasher.update(now.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 桥事件循环：消费插件侧事件（state/log/notification…），驱动窗口导航。
+/// 断线自动重连；M1 阶段 notification 仅记日志（M2 接系统通知）。
+fn bridge_loop(
+    mut client: bridge::BridgeClient,
+    window: tauri::WebviewWindow,
+    handle: tauri::AppHandle,
+) {
+    loop {
+        match client.recv_message() {
+            Ok(message) => {
+                let kind = message.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match kind {
+                    "state" => {
+                        let phase = message.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                        if phase == "ready" {
+                            let host = message
+                                .get("host")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("127.0.0.1");
+                            let port = message.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if port > 0 {
+                                let url = format!("http://{host}:{port}");
+                                log_line(&handle, &format!("bridge: ready, navigating to {url}"));
+                                if let Ok(url) = Url::parse(&url) {
+                                    let _ = window.navigate(url);
+                                    let _ = client.send_message(
+                                        &serde_json::json!({ "type": "nav-result", "ok": true }),
+                                    );
+                                }
+                            }
+                        } else if phase == "error" {
+                            let detail = message
+                                .get("detail")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("未知错误");
+                            log_line(&handle, &format!("bridge: server error: {detail}"));
+                            show_error(&window, &format!("本地服务启动失败：{detail}"));
+                        }
+                    }
+                    "log" => {
+                        if let Some(line) = message.get("line").and_then(|v| v.as_str()) {
+                            log_line(&handle, &format!("bridge: {line}"));
+                        }
+                    }
+                    "notification" => {
+                        // M2: 接入 tauri-plugin-notification
+                        let title = message
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        log_line(&handle, &format!("bridge: notification: {title}"));
+                    }
+                    _ => {
+                        log_line(&handle, &format!("bridge: event {}", kind));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                log_line(&handle, "bridge: connection closed, reconnecting…");
+                match client.reconnect() {
+                    Ok(_) => log_line(&handle, "bridge: reconnected"),
+                    Err(e) => {
+                        log_line(&handle, &format!("bridge: reconnect failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                log_line(&handle, &format!("bridge: read error: {e}"));
+                break;
+            }
+        }
+    }
+}
+
 /// The full first-run bootstrap: node runtime, dependency closure, server.
 fn bootstrap_and_run(
     handle: tauri::AppHandle,
@@ -468,11 +559,30 @@ fn bootstrap_and_run(
 
     let bin_js = deps.join("node_modules").join("@deepseek-ai").join("dsh").join("lib").join("bin.js");
     let port = pick_free_port();
-    let child = match Command::new(win_clean(&node_exe))
-        .arg(win_clean(&bin_js))
-        .arg("web")
-        .arg("--port")
-        .arg(port.to_string())
+
+    // M1: 发行版组合包叠加层存在时启用插件化启动（--profile web --patch）。
+    // 桥 token 经环境变量注入，插件侧同名环境变量检测到才挂桥（纯 web 模式降级）。
+    let desktop_patch = bootstrap_dir.join("desktop.yml");
+    let bridge_token = desktop_patch.exists().then(make_token);
+
+    let mut cmd = Command::new(win_clean(&node_exe));
+    cmd.arg(win_clean(&bin_js));
+    match &bridge_token {
+        Some(token) => {
+            cmd.arg("--profile")
+                .arg("web")
+                .arg("--patch")
+                .arg(win_clean(&desktop_patch))
+                .arg("--port")
+                .arg(port.to_string())
+                .env("DSH_DESKTOP_TOKEN", token);
+            log_line(&handle, &format!("desktop patch: {}", desktop_patch.display()));
+        }
+        None => {
+            cmd.arg("web").arg("--port").arg(port.to_string());
+        }
+    }
+    let child = match cmd
         .current_dir(win_clean(&deps))
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(File::create(log_dir.join("server.out.log")).map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
@@ -483,6 +593,21 @@ fn bootstrap_and_run(
         Err(e) => return fail(&window, format!("server 启动失败: {e}")),
     };
     handle.manage(ServerState(Mutex::new(Some(child))));
+
+    // 桥线程：连接插件侧桥服务，ready 事件驱动导航（wait_for_port 保留为兜底）
+    let bridge_window = window.clone();
+    if let Some(token) = bridge_token {
+        let bridge_handle = handle.clone();
+        std::thread::spawn(move || {
+            let endpoint = bridge::endpoint(&token);
+            std::thread::sleep(Duration::from_secs(1)); // 等子进程起来
+            log_line(&bridge_handle, &format!("bridge: connecting to {endpoint}"));
+            match bridge::BridgeClient::connect_with_retry(&endpoint) {
+                Ok(client) => bridge_loop(client, bridge_window, bridge_handle),
+                Err(e) => log_line(&bridge_handle, &format!("bridge: connect failed: {e}")),
+            }
+        });
+    }
 
     std::thread::spawn(move || {
         if wait_for_port(port, Duration::from_secs(120)) {

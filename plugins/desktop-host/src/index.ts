@@ -17,6 +17,13 @@ import { detectReady } from "./lifecycle.ts";
 
 export const name = "dsh-desktop-host";
 
+/**
+ * 声明服务依赖：webServer 就绪后本插件才激活（其 .port 即实际监听端口）。
+ * 注意：依赖在组合层面注入——web 组合含 dsh-host-webserver 必然满足；
+ * 若用于无 webServer 的组合（如 tui），应由组合文件去掉本行。
+ */
+export const inject = ["webServer"];
+
 export function apply(ctx: Context) {
   const token = process.env.DSH_DESKTOP_TOKEN;
   if (!token) {
@@ -25,18 +32,36 @@ export function apply(ctx: Context) {
   }
 
   ctx.effect(() => {
-    const bridge = new DesktopBridgeServer(token, (command) => {
-      void handleCommand(ctx, bridge, command);
-    });
+    // 最近一次状态：客户端（壳）连接/重连时重放，避免错过事件
+    let lastState: BridgeMessage | null = null;
+    const setState = (state: BridgeMessage) => {
+      lastState = state;
+      bridge.send(state);
+    };
+
+    const bridge = new DesktopBridgeServer(
+      token,
+      (command) => {
+        void handleCommand(ctx, bridge, command);
+      },
+      (socket) => {
+        // 壳（重）连接：立即补发当前状态
+        if (lastState) {
+          socket.write(JSON.stringify(lastState) + "\n");
+        }
+      },
+    );
 
     void bridge.start().then((endpoint) => {
       ctx.logger.info(`[dsh-desktop-host] bridge up: ${endpoint}`);
       bridge.send({ type: "log", line: `bridge up: ${endpoint}` });
+      console.error(`[dsh-desktop-host] bridge up: ${endpoint}`); // 冒烟诊断
 
       // 服务就绪 → 通知壳导航窗口并刷新托盘状态
       void detectReady(ctx).then(
         ({ host, port }) => {
-          bridge.send({ type: "state", phase: "ready", host, port, detail: "" });
+          ctx.logger.info(`[dsh-desktop-host] ready at ${host}:${port}`);
+          setState({ type: "state", phase: "ready", host, port, detail: "" });
           bridge.send({
             type: "notification",
             title: "DeepSeek Harness 已就绪",
@@ -46,7 +71,8 @@ export function apply(ctx: Context) {
         },
         (error: unknown) => {
           ctx.logger.error(`[dsh-desktop-host] ready detection failed: ${error}`);
-          bridge.send({ type: "state", phase: "error", detail: String(error) });
+          console.error(`[dsh-desktop-host] ready detection failed: ${error}`);
+          setState({ type: "state", phase: "error", detail: String(error) });
         },
       );
     });

@@ -36,13 +36,19 @@ export function bridgeEndpoint(token: string): string {
 export class DesktopBridgeServer {
   #token: string;
   #onCommand: (message: BridgeMessage) => void;
+  #onClientConnect: (socket: Socket) => void;
   #server: Server | null = null;
   #clients = new Set<Socket>();
   #stopped = false;
 
-  constructor(token: string, onCommand: (message: BridgeMessage) => void) {
+  constructor(
+    token: string,
+    onCommand: (message: BridgeMessage) => void,
+    onClientConnect: (socket: Socket) => void = () => {},
+  ) {
     this.#token = token;
     this.#onCommand = onCommand;
+    this.#onClientConnect = onClientConnect;
   }
 
   get endpoint(): string {
@@ -104,6 +110,7 @@ export class DesktopBridgeServer {
 
   #attach(socket: Socket): void {
     this.#clients.add(socket);
+    this.#onClientConnect(socket); // 重放钩子：壳重连后立即恢复状态
     socket.on("close", () => this.#clients.delete(socket));
     socket.on("error", () => this.#clients.delete(socket));
     createInterface({ input: socket }).on("line", (line) => {

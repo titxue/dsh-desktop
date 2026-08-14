@@ -1,0 +1,8 @@
+# dsh-desktop 发行版组合包叠加层（M4 时随资源发布，由壳以
+#   dsh --profile web --patch <此文件> 加载）。
+# 语法依据 cordis-plugin-include 的 patch 语义（已实测验证）：
+#   - insert: [...]   把新插件条目追加进 profile（本文件用法）
+#   - id: <已有id>     覆盖已有条目的 config/disabled 等
+- insert:
+    - id: desktop-host
+      name: '@titxue/dsh-desktop-host'

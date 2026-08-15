@@ -87,9 +87,11 @@ export function apply(ctx: Context) {
 async function handleCommand(ctx: Context, bridge: DesktopBridgeServer, command: BridgeMessage) {
   switch (command.type) {
     case "shutdown-request":
-      ctx.logger.info("[dsh-desktop-host] shutdown requested");
+      ctx.logger.info("[dsh-desktop-host] shutdown requested, exiting");
       bridge.send({ type: "log", line: "shutdown acknowledged" });
-      // TODO(M3): 触发宿主优雅退出（等价于卸载本插件，框架自动清理所有注册）
+      // 给壳留出收到回执的时间，然后退出本进程（OS 回收全部资源；
+      // 壳侧另有 taskkill 兜底，2s 后未退即强杀）
+      setTimeout(() => process.exit(0), 200);
       break;
     case "menu-click":
       ctx.logger.info(`[dsh-desktop-host] menu click: ${String(command.id)}`);

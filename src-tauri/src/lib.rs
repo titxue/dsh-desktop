@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tauri::Url;
+use tauri_plugin_autostart::ManagerExt;
 
 /// 桌面壳 ↔ dsh 进程的通用 IPC 桥（Windows 管道 / POSIX unix socket）。
 /// 接入点：M1 桥客户端线程消费事件、发送命令（见 docs/design-desktop-host.md）。
@@ -44,6 +45,51 @@ struct ServerState {
 struct TrayState {
     phase: String, // idle | ready | error | off
     detail: String,
+}
+
+/// 壳侧本地设置（持久化到 app_config_dir/settings.json）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ShellSettings {
+    #[serde(default = "default_true")]
+    minimize_to_tray: bool,
+    #[serde(default)]
+    launch_at_login: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            minimize_to_tray: true,
+            launch_at_login: false,
+        }
+    }
+}
+
+fn settings_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("settings.json")
+}
+
+fn load_settings(app: &tauri::AppHandle) -> ShellSettings {
+    std::fs::read_to_string(settings_path(app))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(app: &tauri::AppHandle, settings: &ShellSettings) {
+    if let Ok(dir) = app.path().app_config_dir() {
+        let _ = create_dir_all(&dir);
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(dir.join("settings.json"), json);
+        }
+    }
 }
 
 /// Pinned Node.js runtime manifest shipped in the bootstrap resources.
@@ -468,6 +514,11 @@ fn build_tray_menu(app: &tauri::AppHandle, state: &TrayState) -> tauri::Result<M
     let restart = MenuItem::with_id(app, "restart", "重新启动服务", true, None::<&str>)?;
     let data_dir = MenuItem::with_id(app, "data-dir", "打开数据目录", true, None::<&str>)?;
     let log_dir = MenuItem::with_id(app, "log-dir", "打开日志目录", true, None::<&str>)?;
+    // M3: 复选设置项（状态来自 autostart 插件 / 本地 settings.json）
+    let settings = load_settings(app);
+    let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
+    let autostart = CheckMenuItem::with_id(app, "autostart", "开机自启", true, autostart_on, None::<&str>)?;
+    let minimize = CheckMenuItem::with_id(app, "minimize", "关闭时最小化到托盘", true, settings.minimize_to_tray, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Menu::with_items(
         app,
@@ -480,9 +531,25 @@ fn build_tray_menu(app: &tauri::AppHandle, state: &TrayState) -> tauri::Result<M
             &data_dir,
             &log_dir,
             &PredefinedMenuItem::separator(app)?,
+            &autostart,
+            &minimize,
+            &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
     )
+}
+
+/// 按当前 TrayState 重建菜单（设置项切换后刷新复选状态）。
+fn refresh_tray_menu(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<Mutex<TrayState>>() {
+        if let Ok(guard) = state.lock() {
+            if let Ok(menu) = build_tray_menu(app, &guard) {
+                if let Some(tray) = app.tray_by_id("main-tray") {
+                    let _ = tray.set_menu(Some(menu));
+                }
+            }
+        }
+    }
 }
 
 /// 更新托盘：图标状态 + 状态行（bridge 事件与本地事件共用）。
@@ -615,8 +682,44 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
                 open_path(&dir);
             }
         }
+        "autostart" => {
+            // 开机自启：切换 autostart 插件状态并刷新菜单复选
+            let enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            let result = if enabled {
+                app.autolaunch().disable()
+            } else {
+                app.autolaunch().enable()
+            };
+            if let Err(e) = result {
+                log_line(app, &format!("autostart toggle failed: {e}"));
+            }
+            refresh_tray_menu(app);
+        }
+        "minimize" => {
+            // 关闭时最小化到托盘：切换本地设置
+            let mut settings = load_settings(app);
+            settings.minimize_to_tray = !settings.minimize_to_tray;
+            save_settings(app, &settings);
+            refresh_tray_menu(app);
+        }
         "quit" => {
-            log_line(app, "tray quit requested");
+            // M3 优雅关闭：先通知插件侧清理，等 2s，再强杀兜底退出
+            log_line(app, "tray quit requested (graceful)");
+            if let Some(state) = app.try_state::<ServerState>() {
+                if let Ok(guard) = state.spawn.lock() {
+                    if let Some(spawn) = guard.as_ref() {
+                        if let Some(token) = &spawn.token {
+                            if let Ok(mut client) = bridge::BridgeClient::connect_with_retry(&bridge::endpoint(token)) {
+                                let _ = client.send_message(
+                                    &serde_json::json!({ "type": "shutdown-request", "graceful": true }),
+                                );
+                                log_line(app, "shutdown-request sent to plugin");
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
             app.exit(0);
         }
         _ => {}
@@ -834,7 +937,14 @@ fn bootstrap_and_run(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // M3: 二次启动 → 聚焦已有窗口并提示
+            log_line(app, "second instance detected, focusing main window");
+            show_main_window(app);
+            notify(app, "DeepSeek Harness 已在运行", "已切换到现有窗口。");
+        }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
             let exe_dir = app
@@ -908,16 +1018,19 @@ pub fn run() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let url = window_url(&app_handle, &label);
                     log_line(&app_handle, &format!("window {label}: CloseRequested url={url}"));
-                    // M2: 关闭按钮 → 最小化到托盘（托盘"退出"才是真正退出）
-                    api.prevent_close();
-                    if let Some(window) = app_handle.get_webview_window(&label) {
-                        let _ = window.hide();
+                    // M2/M3: 关闭按钮行为由"最小化到托盘"设置决定
+                    let settings = load_settings(&app_handle);
+                    if settings.minimize_to_tray {
+                        api.prevent_close();
+                        if let Some(window) = app_handle.get_webview_window(&label) {
+                            let _ = window.hide();
+                        }
+                        notify(
+                            &app_handle,
+                            "DeepSeek Harness 仍在运行",
+                            "已最小化到系统托盘，点击托盘图标可重新打开。",
+                        );
                     }
-                    notify(
-                        &app_handle,
-                        "DeepSeek Harness 仍在运行",
-                        "已最小化到系统托盘，点击托盘图标可重新打开。",
-                    );
                 }
                 tauri::WindowEvent::Destroyed => {
                     log_line(&app_handle, &format!("window {label}: Destroyed"));

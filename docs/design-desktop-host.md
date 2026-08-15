@@ -112,6 +112,10 @@ plugins/desktop-host/
   src/progress.ts       引导进度转发（M2）
 ```
 
+**M2 实现偏差说明**：托盘菜单在**壳侧构建**（菜单项多为壳本地动作：显示/打开目录/退出），
+  插件侧仅通过 state 事件驱动状态行与图标；设计中的"插件下发完整菜单模型"（menu 事件）暂缓——
+  当需要插件自定义菜单项时再启用（协议已预留 menu 类型）。
+
 **cordis 4 的两个关键约束（M1 实测踩坑）**：
 - 访问服务必须声明依赖：`export const inject = ["webServer"]`（否则
   `cannot get property "webServer" without inject`）；依赖在组合层面注入，
@@ -225,7 +229,7 @@ desktop:
 | 里程碑 | 内容 | 验收标准 |
 |--------|------|----------|
 | **M1 桥 + 就绪事件** ✅ 已完成 | 插件骨架（apply/ctx.effect/桥服务）；desktop.yml insert 语义验证；壳侧桥客户端（BridgeClient）+ lib.rs 接线（ready 驱动导航，wait_for_port 兜底）；状态重放 | 实测通过：`dsh --profile web --patch desktop.yml` 加载插件 → 桥 up → `state: ready {host, port}` 经命名管道送达 Rust 客户端（含重连重放）；纯 web 模式（无 token）不受影响 |
-| **M2 托盘** | 图标 4 态、菜单模型下发、显示/退出、通知 | 托盘全交互可用；关闭按钮最小化到托盘 |
+| **M2 托盘** ✅ 已完成 | 图标 4 态（tray-idle/ready/error/off，scripts/gen-tray-icons.mjs 生成）；壳侧菜单 + 状态行动态更新；关闭按钮 → 最小化到托盘；托盘退出 → 优雅退出；重启服务；系统通知（tauri-plugin-notification） | 编译通过；菜单项 show/open/restart/data-dir/log-dir/quit + 左键单击显示窗口；bridge 事件驱动图标与状态行 |
 | **M3 生命周期增强** | 重启服务、优雅关闭、单实例、自启、设置项 | 重启秒级恢复；二次启动聚焦；退出不留孤儿进程 |
 | **M4 发布** | 插件发布 npm；bootstrap/package.json 加入固定版本；setup-runtime.ts 组装支持；**CI 三平台构建矩阵**（Windows NSIS / macOS DMG / Linux deb+AppImage）；node-manifest 多平台 SHA-256；README 更新 | 三平台安装包各自首启成功、托盘全功能；**仓库含真正插件 → dsh-plugin topic 名副其实** |
 

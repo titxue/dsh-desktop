@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tauri::Url;
 
@@ -19,8 +21,30 @@ pub mod bridge;
 /// CREATE_NO_WINDOW: keep the server and npm consoles hidden.
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Holds the spawned dsh server child so the app can stop it on exit.
-struct ServerState(Mutex<Option<Child>>);
+/// dsh 服务进程的重启参数（托盘"重新启动服务"用）。
+#[derive(Clone)]
+struct ServerSpawn {
+    node_exe: PathBuf,
+    bin_js: PathBuf,
+    deps: PathBuf,
+    port: u16,
+    desktop_patch: Option<PathBuf>,
+    token: Option<String>,
+    log_dir: PathBuf,
+}
+
+/// 服务子进程 + 重启参数；托盘"退出"时按此清理进程树。
+#[derive(Default)]
+struct ServerState {
+    child: Mutex<Option<Child>>,
+    spawn: Mutex<Option<ServerSpawn>>,
+}
+
+/// 托盘显示状态（单一事实来源：bridge 事件 → 这里 → 图标/菜单渲染）。
+struct TrayState {
+    phase: String, // idle | ready | error | off
+    detail: String,
+}
 
 /// Pinned Node.js runtime manifest shipped in the bootstrap resources.
 #[derive(Deserialize)]
@@ -421,6 +445,184 @@ fn show_error(window: &tauri::WebviewWindow, message: &str) {
     }
 }
 
+/// 托盘状态图标（编译期嵌入，scripts/gen-tray-icons.mjs 生成）。
+fn tray_icon_bytes(phase: &str) -> &'static [u8] {
+    match phase {
+        "ready" => include_bytes!("../icons/tray/tray-ready.png"),
+        "error" => include_bytes!("../icons/tray/tray-error.png"),
+        "off" => include_bytes!("../icons/tray/tray-off.png"),
+        _ => include_bytes!("../icons/tray/tray-idle.png"),
+    }
+}
+
+/// 重建托盘菜单（状态行由 TrayState 动态生成）。
+fn build_tray_menu(app: &tauri::AppHandle, state: &TrayState) -> tauri::Result<Menu<tauri::Wry>> {
+    let status_text = if state.detail.is_empty() {
+        format!("状态：{}", state.phase)
+    } else {
+        format!("状态：{} · {}", state.phase, state.detail)
+    };
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let status = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;
+    let restart = MenuItem::with_id(app, "restart", "重新启动服务", true, None::<&str>)?;
+    let data_dir = MenuItem::with_id(app, "data-dir", "打开数据目录", true, None::<&str>)?;
+    let log_dir = MenuItem::with_id(app, "log-dir", "打开日志目录", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    Menu::with_items(
+        app,
+        &[
+            &show,
+            &status,
+            &PredefinedMenuItem::separator(app)?,
+            &open,
+            &restart,
+            &data_dir,
+            &log_dir,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )
+}
+
+/// 更新托盘：图标状态 + 状态行（bridge 事件与本地事件共用）。
+fn set_tray_phase(app: &tauri::AppHandle, phase: &str, detail: &str) {
+    if let Some(state) = app.try_state::<Mutex<TrayState>>() {
+        if let Ok(mut guard) = state.lock() {
+            guard.phase = phase.to_string();
+            guard.detail = detail.to_string();
+        }
+    }
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return;
+    };
+    if let Ok(image) = tauri::image::Image::from_bytes(tray_icon_bytes(phase)) {
+        let _ = tray.set_icon(Some(image));
+    }
+    if let Some(state) = app.try_state::<Mutex<TrayState>>() {
+        if let Ok(guard) = state.lock() {
+            if let Ok(menu) = build_tray_menu(app, &guard) {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+    }
+}
+
+/// 系统通知（桥 notification 事件 / 本地提示）。
+fn notify(app: &tauri::AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    log_line(app, &format!("notify: {title} — {body}"));
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// 用系统文件管理器打开目录。
+fn open_path(path: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(path).spawn();
+}
+
+/// 显示并聚焦主窗口（托盘左键/菜单"显示"）。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// spawn dsh 服务进程（首次启动与托盘"重启"共用）。
+fn spawn_server(spawn: &ServerSpawn) -> std::io::Result<Child> {
+    let mut cmd = Command::new(win_clean(&spawn.node_exe));
+    cmd.arg(win_clean(&spawn.bin_js));
+    match &spawn.token {
+        Some(token) => {
+            cmd.arg("--profile")
+                .arg("web")
+                .arg("--patch")
+                .arg(win_clean(spawn.desktop_patch.as_ref().unwrap()))
+                .arg("--port")
+                .arg(spawn.port.to_string())
+                .env("DSH_DESKTOP_TOKEN", token);
+        }
+        None => {
+            cmd.arg("web").arg("--port").arg(spawn.port.to_string());
+        }
+    }
+    cmd.current_dir(win_clean(&spawn.deps))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(
+            File::create(spawn.log_dir.join("server.out.log"))
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null()),
+        )
+        .stderr(
+            File::create(spawn.log_dir.join("server.err.log"))
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null()),
+        );
+    cmd.spawn()
+}
+
+/// 托盘"重新启动服务"：杀旧进程树 → 重新 spawn（bootstrap 缓存命中，秒级恢复）。
+fn restart_server(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<ServerState>() else {
+        return;
+    };
+    let spawn = state.spawn.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(spawn) = spawn else {
+        log_line(app, "restart: no spawn args yet");
+        return;
+    };
+    {
+        let mut guard = state.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = guard.as_mut() {
+            kill_tree(child);
+        }
+        *guard = None;
+    }
+    match spawn_server(&spawn) {
+        Ok(child) => {
+            if let Ok(mut guard) = state.child.lock() {
+                *guard = Some(child);
+            }
+            set_tray_phase(app, "idle", "重启中…");
+            log_line(app, "server restarted");
+        }
+        Err(e) => {
+            set_tray_phase(app, "error", &format!("重启失败: {e}"));
+            log_line(app, &format!("restart failed: {e}"));
+        }
+    }
+}
+
+/// 托盘菜单点击分发（id 见 build_tray_menu）。
+fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
+    log_line(app, &format!("tray menu: {id}"));
+    match id {
+        "show" | "open" => show_main_window(app),
+        "restart" => restart_server(app),
+        "data-dir" => {
+            if let Ok(dir) = app.path().app_local_data_dir() {
+                open_path(&dir);
+            }
+        }
+        "log-dir" => {
+            if let Ok(dir) = app.path().app_log_dir() {
+                open_path(&dir);
+            }
+        }
+        "quit" => {
+            log_line(app, "tray quit requested");
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
 /// 生成桥 token：sha256(时间戳 + pid + 计数器)。端点名即认证，仅防本机
 /// 其他进程猜测；非密码学级随机但足够（管道名不可枚举）。
 fn make_token() -> String {
@@ -460,6 +662,7 @@ fn bridge_loop(
                             if port > 0 {
                                 let url = format!("http://{host}:{port}");
                                 log_line(&handle, &format!("bridge: ready, navigating to {url}"));
+                                set_tray_phase(&handle, "ready", &format!("端口 {port}"));
                                 if let Ok(url) = Url::parse(&url) {
                                     let _ = window.navigate(url);
                                     let _ = client.send_message(
@@ -473,6 +676,7 @@ fn bridge_loop(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("未知错误");
                             log_line(&handle, &format!("bridge: server error: {detail}"));
+                            set_tray_phase(&handle, "error", detail);
                             show_error(&window, &format!("本地服务启动失败：{detail}"));
                         }
                     }
@@ -482,12 +686,15 @@ fn bridge_loop(
                         }
                     }
                     "notification" => {
-                        // M2: 接入 tauri-plugin-notification
                         let title = message
                             .get("title")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        log_line(&handle, &format!("bridge: notification: {title}"));
+                        let body = message
+                            .get("body")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        notify(&handle, title, body);
                     }
                     _ => {
                         log_line(&handle, &format!("bridge: event {}", kind));
@@ -496,8 +703,12 @@ fn bridge_loop(
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 log_line(&handle, "bridge: connection closed, reconnecting…");
+                set_tray_phase(&handle, "off", "桥连接断开");
                 match client.reconnect() {
-                    Ok(_) => log_line(&handle, "bridge: reconnected"),
+                    Ok(_) => {
+                        log_line(&handle, "bridge: reconnected");
+                        set_tray_phase(&handle, "idle", "已重连");
+                    }
                     Err(e) => {
                         log_line(&handle, &format!("bridge: reconnect failed: {e}"));
                         break;
@@ -506,6 +717,7 @@ fn bridge_loop(
             }
             Err(e) => {
                 log_line(&handle, &format!("bridge: read error: {e}"));
+                set_tray_phase(&handle, "off", "桥异常");
                 break;
             }
         }
@@ -565,34 +777,24 @@ fn bootstrap_and_run(
     let desktop_patch = bootstrap_dir.join("desktop.yml");
     let bridge_token = desktop_patch.exists().then(make_token);
 
-    let mut cmd = Command::new(win_clean(&node_exe));
-    cmd.arg(win_clean(&bin_js));
-    match &bridge_token {
-        Some(token) => {
-            cmd.arg("--profile")
-                .arg("web")
-                .arg("--patch")
-                .arg(win_clean(&desktop_patch))
-                .arg("--port")
-                .arg(port.to_string())
-                .env("DSH_DESKTOP_TOKEN", token);
-            log_line(&handle, &format!("desktop patch: {}", desktop_patch.display()));
-        }
-        None => {
-            cmd.arg("web").arg("--port").arg(port.to_string());
-        }
-    }
-    let child = match cmd
-        .current_dir(win_clean(&deps))
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(File::create(log_dir.join("server.out.log")).map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
-        .stderr(File::create(log_dir.join("server.err.log")).map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
-        .spawn()
-    {
+    let spawn = ServerSpawn {
+        node_exe: node_exe.clone(),
+        bin_js,
+        deps: deps.clone(),
+        port,
+        desktop_patch: desktop_patch.exists().then(|| desktop_patch.clone()),
+        token: bridge_token.clone(),
+        log_dir: log_dir.clone(),
+    };
+    let child = match spawn_server(&spawn) {
         Ok(c) => c,
         Err(e) => return fail(&window, format!("server 启动失败: {e}")),
     };
-    handle.manage(ServerState(Mutex::new(Some(child))));
+    handle.manage(ServerState {
+        child: Mutex::new(Some(child)),
+        spawn: Mutex::new(Some(spawn)),
+    });
+    set_tray_phase(&handle, "idle", "服务启动中…");
 
     // 桥线程：连接插件侧桥服务，ready 事件驱动导航（wait_for_port 保留为兜底）
     let bridge_window = window.clone();
@@ -604,7 +806,10 @@ fn bootstrap_and_run(
             log_line(&bridge_handle, &format!("bridge: connecting to {endpoint}"));
             match bridge::BridgeClient::connect_with_retry(&endpoint) {
                 Ok(client) => bridge_loop(client, bridge_window, bridge_handle),
-                Err(e) => log_line(&bridge_handle, &format!("bridge: connect failed: {e}")),
+                Err(e) => {
+                    log_line(&bridge_handle, &format!("bridge: connect failed: {e}"));
+                    set_tray_phase(&bridge_handle, "off", "桥连接失败");
+                }
             }
         });
     }
@@ -614,11 +819,13 @@ fn bootstrap_and_run(
             let url = format!("http://127.0.0.1:{port}");
             log_line(&handle, &format!("server ready, navigating to {url}"));
             send_progress(&shared, &window, ProgressState::new("ready", "", None, ""));
+            set_tray_phase(&handle, "ready", &format!("端口 {port}"));
             if let Ok(url) = Url::parse(&url) {
                 let _ = window.navigate(url);
             }
         } else {
             log_line(&handle, "server did not become ready in 120s");
+            set_tray_phase(&handle, "error", "服务 120s 未就绪");
             show_error(&window, "本地服务在 120 秒内未就绪，请查看 logs\\server.err.log。");
         }
     });
@@ -627,6 +834,7 @@ fn bootstrap_and_run(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
             let exe_dir = app
@@ -645,6 +853,35 @@ pub fn run() {
             .min_inner_size(960.0, 640.0)
             .build()?;
 
+            // 系统托盘（M2）：图标状态 + 菜单模型；左键单击显示窗口
+            app.manage(Mutex::new(TrayState {
+                phase: "idle".to_string(),
+                detail: "启动中…".to_string(),
+            }));
+            let initial_tray = TrayState {
+                phase: "idle".to_string(),
+                detail: "启动中…".to_string(),
+            };
+            let tray = TrayIconBuilder::with_id("main-tray")
+                .icon(tauri::image::Image::from_bytes(tray_icon_bytes("idle"))?)
+                .menu(&build_tray_menu(app.handle(), &initial_tray)?)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    handle_tray_menu(app, event.id.as_ref());
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            app.manage(tray);
+
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 bootstrap_and_run(handle, window, resource_dir, exe_dir, shared);
@@ -660,7 +897,7 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 log_line(&app_handle, "event: Exit");
                 if let Some(state) = app_handle.try_state::<ServerState>() {
-                    if let Ok(mut guard) = state.0.lock() {
+                    if let Ok(mut guard) = state.child.lock() {
                         if let Some(child) = guard.as_mut() {
                             kill_tree(child);
                         }
@@ -668,9 +905,19 @@ pub fn run() {
                 }
             }
             tauri::RunEvent::WindowEvent { label, event, .. } => match event {
-                tauri::WindowEvent::CloseRequested { .. } => {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
                     let url = window_url(&app_handle, &label);
                     log_line(&app_handle, &format!("window {label}: CloseRequested url={url}"));
+                    // M2: 关闭按钮 → 最小化到托盘（托盘"退出"才是真正退出）
+                    api.prevent_close();
+                    if let Some(window) = app_handle.get_webview_window(&label) {
+                        let _ = window.hide();
+                    }
+                    notify(
+                        &app_handle,
+                        "DeepSeek Harness 仍在运行",
+                        "已最小化到系统托盘，点击托盘图标可重新打开。",
+                    );
                 }
                 tauri::WindowEvent::Destroyed => {
                     log_line(&app_handle, &format!("window {label}: Destroyed"));

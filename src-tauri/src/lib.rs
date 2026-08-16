@@ -601,6 +601,61 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 递归复制目录（插件包分发用）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 发行版插件落地：把随 bootstrap 资源分发的 @titxue/dsh-desktop-host
+/// 复制到 $DSH_HOME/profiles/web/node_modules（dsh 的 out-of-tree 插件
+/// 解析位置，loader baseUrl 的 parent-walk 链；M1/M4 实证）。
+/// 幂等：目标已存在且来自同源时跳过；无插件资源时静默（旧版资源兼容）。
+fn ensure_desktop_plugin(bootstrap_dir: &Path) -> std::io::Result<()> {
+    let src = bootstrap_dir
+        .join("plugin")
+        .join("@titxue")
+        .join("dsh-desktop-host");
+    if !src.join("package.json").exists() {
+        return Ok(()); // 资源里没有插件（旧版 bootstrap），跳过
+    }
+    let home = std::env::var_os("DSH_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".dsh")
+        });
+    let dst = home
+        .join("profiles")
+        .join("web")
+        .join("node_modules")
+        .join("@titxue")
+        .join("dsh-desktop-host");
+    if dst.join("package.json").exists() {
+        return Ok(()); // 已安装
+    }
+    log_to_stdout(&format!("installing desktop plugin -> {}", dst.display()));
+    copy_dir_recursive(&src, &dst)
+}
+
+/// 引导早期日志（desktop.log 尚未就绪时用）。
+fn log_to_stdout(line: &str) {
+    eprintln!("[dsh-desktop] {line}");
+}
+
 /// spawn dsh 服务进程（首次启动与托盘"重启"共用）。
 fn spawn_server(spawn: &ServerSpawn) -> std::io::Result<Child> {
     let mut cmd = Command::new(win_clean(&spawn.node_exe));
@@ -870,6 +925,11 @@ fn bootstrap_and_run(
     let log_dir = handle.path().app_log_dir().unwrap_or_else(|_| data_dir.clone());
     if let Err(e) = ensure_deps(&deps, &node_exe, &bootstrap_dir, &log_dir, &send) {
         return fail(&window, e);
+    }
+
+    // M4: 发行版插件落地（复制进 DSH_HOME/profiles/web/node_modules）
+    if let Err(e) = ensure_desktop_plugin(&bootstrap_dir) {
+        log_line(&handle, &format!("desktop plugin install failed: {e}"));
     }
 
     let bin_js = deps.join("node_modules").join("@deepseek-ai").join("dsh").join("lib").join("bin.js");

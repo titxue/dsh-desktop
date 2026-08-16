@@ -4,6 +4,14 @@ node_modules/
 # --- 插件构建产物 ---
 plugins/desktop-host/lib/
 
+# --- 组装产物（scripts/setup-runtime.ts 生成） ---
+bootstrap/plugin/
+bootstrap/desktop.yml
+
+# --- 本地测试（M1/M4 冒烟用的临时 DSH_HOME） ---
+.tmp-dsh-home/
+.tmp-*/
+
 # --- Rust / Tauri build artifacts ---
 src-tauri/target/
 src-tauri/gen/schemas/

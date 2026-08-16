@@ -64,6 +64,33 @@ if (bundleMode) {
   return;
 }
 
+/** 构建发行版插件并复制进 bootstrap/plugin（供壳复制进 profile）。 */
+function buildDesktopPlugin(bootstrap) {
+  const pluginDir = join(root, "plugins", "desktop-host");
+  const pkgPath = join(pluginDir, "package.json");
+  if (!existsSync(pkgPath)) {
+    console.log("plugins/desktop-host 不存在，跳过发行版插件");
+    return;
+  }
+  // 构建产物（lib/）：已有则复用，否则尝试 tsc
+  const lib = join(pluginDir, "lib");
+  const hasTsc = existsSync(join(pluginDir, "node_modules", ".bin", "tsc" + (process.platform === "win32" ? ".cmd" : "")));
+  if (!existsSync(join(lib, "index.js"))) {
+    if (!hasTsc) throw new Error("需要先构建插件：cd plugins/desktop-host && npm i && npx tsc");
+    execFileSync(hasTsc ? join(pluginDir, "node_modules", ".bin", "tsc" + (process.platform === "win32" ? ".cmd" : "")) : "tsc",
+      ["-p", join(pluginDir, "tsconfig.json")], { stdio: "inherit" });
+  }
+  const out = join(bootstrap, "plugin", "@titxue", "dsh-desktop-host");
+  rmSync(out, { recursive: true, force: true });
+  mkdirSync(out, { recursive: true });
+  cpSync(pkgPath, join(out, "package.json"));
+  cpSync(lib, join(out, "lib"), { recursive: true });
+  console.log("wrote bootstrap/plugin/@titxue/dsh-desktop-host");
+  // desktop.yml 叠加层
+  cpSync(join(pluginDir, "desktop.yml"), join(bootstrap, "desktop.yml"));
+  console.log("wrote bootstrap/desktop.yml");
+}
+
 // ---- dynamic mode: bootstrap resources ----
 const bootstrap = join(root, "bootstrap");
 mkdirSync(bootstrap, { recursive: true });

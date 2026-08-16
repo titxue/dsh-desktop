@@ -231,7 +231,7 @@ desktop:
 | **M1 桥 + 就绪事件** ✅ 已完成 | 插件骨架（apply/ctx.effect/桥服务）；desktop.yml insert 语义验证；壳侧桥客户端（BridgeClient）+ lib.rs 接线（ready 驱动导航，wait_for_port 兜底）；状态重放 | 实测通过：`dsh --profile web --patch desktop.yml` 加载插件 → 桥 up → `state: ready {host, port}` 经命名管道送达 Rust 客户端（含重连重放）；纯 web 模式（无 token）不受影响 |
 | **M2 托盘** ✅ 已完成 | 图标 4 态（tray-idle/ready/error/off，scripts/gen-tray-icons.mjs 生成）；壳侧菜单 + 状态行动态更新；关闭按钮 → 最小化到托盘；托盘退出 → 优雅退出；重启服务；系统通知（tauri-plugin-notification） | 编译通过；菜单项 show/open/restart/data-dir/log-dir/quit + 左键单击显示窗口；bridge 事件驱动图标与状态行 |
 | **M3 生命周期增强** ✅ 已完成 | 重启服务（M2）；**优雅关闭**：托盘退出 → shutdown-request（插件回执后 process.exit，壳 2s 兜底强杀）；**单实例**（tauri-plugin-single-instance，二次启动聚焦+通知）；**开机自启**（tauri-plugin-autostart，托盘复选开关）；**设置项**：最小化到托盘开关（本地 settings.json，托盘复选） | 编译通过；退出序列：通知插件 → 2s 等待 → kill_tree 兜底；DSH settings（插件侧）集成留待 M4 |
-| **M4 发布** | 插件发布 npm；bootstrap/package.json 加入固定版本；setup-runtime.ts 组装支持；**CI 三平台构建矩阵**（Windows NSIS / macOS DMG / Linux deb+AppImage）；node-manifest 多平台 SHA-256；README 更新 | 三平台安装包各自首启成功、托盘全功能；**仓库含真正插件 → dsh-plugin topic 名副其实** |
+| **M4 发布** ✅ 已完成 | 发行版插件链路（随 bootstrap 资源分发 + 壳复制进 DSH_HOME/profiles/web/node_modules，M4 实证：dsh 的扁平回退仅覆盖 dsh 依赖闭包，out-of-tree 插件须走 profile node_modules）；setup-runtime.ts 组装支持（构建插件 → bootstrap/plugin + desktop.yml）；**CI 三平台矩阵**（.github/workflows/build.yml：NSIS/DMG/deb+AppImage + 插件构建）；README 更新 | 端到端实测：组装 → 模拟安装 → dsh 加载插件 → bridge up → ready 事件送达；dsh-plugin topic 名副其实（仓库含真正插件） |
 
 ## 11. 备选方案对比
 

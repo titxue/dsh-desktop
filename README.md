@@ -53,6 +53,19 @@ bunx tauri build                  # 编译 Rust 并打包 NSIS 安装程序
 - **首次运行进度**：加载页显示实时进度条——Node 下载阶段按实际字节百分比精确推进；npm 阶段按预估 90 秒时间线推进（慢网络自动延长），详情行显示当前下载的包名；窗口标题同步显示状态。
 - 诊断日志：`%LOCALAPPDATA%\ai.deepseek.harness.desktop\logs\`（desktop.log、npm.out/err.log、server.out/err.log）。
 
+## 多平台打包（GitHub Actions）
+
+推送 main 分支自动触发 CI（`.github/workflows/build.yml`），三平台并行构建：
+
+| 平台 | 产物 |
+|------|------|
+| Windows | NSIS 安装包（x64-setup.exe） |
+| macOS | .dmg + .app |
+| Linux | .deb + AppImage |
+
+产物作为 CI artifact 上传，也可附加到 GitHub Release（`gh release create vX.Y.Z` 后由发布流程上传）。
+Node.js 运行时按平台分发（`bootstrap/node-manifest.json` 的 `platforms` 映射，win-x64 / darwin-arm64 / darwin-x64 / linux-x64，各带 SHA-256 校验）。
+
 ## 离线变体（打包 node_modules）
 
 编辑 `src-tauri/tauri.conf.json`，将 `bundle.resources` 改为 `["../runtime"]`，然后执行 `bun scripts/setup-runtime.ts --bundle` 组装完整闭包（`node_modules` + `node.exe`）。外壳会从 exe 同级目录或 NSIS 的 `_up_` 暂存目录查找 `runtime`。安装包体积增至约 45 MB，但可完全离线使用。

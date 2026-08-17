@@ -966,12 +966,17 @@ fn bootstrap_and_run(
         std::thread::spawn(move || {
             let endpoint = bridge::endpoint(&token);
             std::thread::sleep(Duration::from_secs(1)); // 等子进程起来
-            log_line(&bridge_handle, &format!("bridge: connecting to {endpoint}"));
-            match bridge::BridgeClient::connect_with_retry(&endpoint) {
-                Ok(client) => bridge_loop(client, bridge_window, bridge_handle),
-                Err(e) => {
-                    log_line(&bridge_handle, &format!("bridge: connect failed: {e}"));
-                    set_tray_phase(&bridge_handle, "off", "桥连接失败");
+            // 持续重连直到成功：首次启动 npm install 可能让 dsh 进程晚于
+            // 30s 就绪（桥窗口不能只有一次），失败后每 3s 重试
+            loop {
+                log_line(&bridge_handle, &format!("bridge: connecting to {endpoint}"));
+                match bridge::BridgeClient::connect_with_retry(&endpoint) {
+                    Ok(client) => bridge_loop(client, bridge_window.clone(), bridge_handle.clone()),
+                    Err(e) => {
+                        log_line(&bridge_handle, &format!("bridge: connect failed: {e}, retrying…"));
+                        set_tray_phase(&bridge_handle, "off", "桥连接失败，重试中");
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
                 }
             }
         });

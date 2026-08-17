@@ -1,6 +1,7 @@
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -19,7 +20,8 @@ use tauri_plugin_autostart::ManagerExt;
 /// 接入点：M1 桥客户端线程消费事件、发送命令（见 docs/design-desktop-host.md）。
 pub mod bridge;
 
-/// CREATE_NO_WINDOW: keep the server and npm consoles hidden.
+/// CREATE_NO_WINDOW: keep the server and npm consoles hidden (Windows only).
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// dsh 服务进程的重启参数（托盘"重新启动服务"用）。
@@ -46,6 +48,7 @@ struct TrayState {
     phase: String, // idle | ready | error | off
     detail: String,
     update_available: Option<String>, // 有新版时记录版本号
+    update_url: Option<String>,        // 新版发布页 URL
 }
 
 /// 壳侧本地设置（持久化到 app_config_dir/settings.json）。
@@ -94,11 +97,50 @@ fn save_settings(app: &tauri::AppHandle, settings: &ShellSettings) {
 }
 
 /// Pinned Node.js runtime manifest shipped in the bootstrap resources.
-#[derive(Deserialize)]
+/// 新格式按平台提供归档（platforms），旧格式（顶层 urls/sha256，win-x64）兼容。
+#[derive(Deserialize, Default)]
 struct NodeManifest {
     version: String,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    platforms: std::collections::HashMap<String, NodePlatform>,
+}
+
+/// 单个平台的 Node 归档信息。
+#[derive(Deserialize, Clone)]
+struct NodePlatform {
+    archive: String,
     urls: Vec<String>,
     sha256: String,
+}
+
+/// 平台 key（与 node-manifest.json 的 platforms 键一致）。
+fn platform_key() -> String {
+    let os = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        _ => "linux",
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "x64",
+    };
+    format!("{os}-{arch}")
+}
+
+/// 平台对应的 node 可执行文件名。
+fn node_bin_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "node.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "node"
+    }
 }
 
 /// Bootstrap progress pushed to the loading page via window.eval.
@@ -119,6 +161,7 @@ impl ProgressState {
 
 /// Strip the Win32 verbatim (\\?\...) prefix tauri's path resolver returns;
 /// Node's module loader cannot handle \\?\-prefixed entry paths.
+#[cfg(windows)]
 fn win_clean(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if let Some(rest) = raw.strip_prefix("\\\\?\\UNC\\") {
@@ -184,13 +227,26 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Kill the server process tree (Windows: taskkill /T covers worker threads
-/// and shell children).
+/// 非 Windows：路径原样返回。
+#[cfg(not(windows))]
+fn win_clean(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Kill the server process tree.
+/// Windows: taskkill /T covers worker threads and shell children.
+#[cfg(windows)]
 fn kill_tree(child: &mut Child) {
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
+    let _ = child.kill();
+}
+
+/// POSIX：直接 kill 主进程，其子进程由 OS 回收。
+#[cfg(not(windows))]
+fn kill_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
@@ -290,6 +346,28 @@ fn extract_node_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// POSIX：用系统 tar 解压 Node 归档（macOS .tar.gz / Linux .tar.xz），
+/// 剥离顶层目录（--strip-components=1）。
+#[cfg(not(windows))]
+fn extract_tar_archive(tar_path: &Path, dest: &Path) -> Result<(), String> {
+    create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    let output = Command::new("tar")
+        .arg("-xf")
+        .arg(tar_path)
+        .arg("-C")
+        .arg(dest)
+        .arg("--strip-components=1")
+        .output()
+        .map_err(|e| format!("tar spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tar 解压失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// Ensure a usable Node.js exists under "deps/node"; download it from the
 /// manifest mirrors on first use, reporting progress while doing so.
 fn ensure_node(
@@ -297,18 +375,28 @@ fn ensure_node(
     manifest: &NodeManifest,
     send: &dyn Fn(ProgressState),
 ) -> Result<PathBuf, String> {
-    let node_exe = deps.join("node").join("node.exe");
+    let node_exe = deps.join("node").join(node_bin_name());
     if node_exe.exists() {
         return Ok(node_exe);
     }
     create_dir_all(deps).map_err(|e| format!("mkdir {}: {e}", deps.display()))?;
 
-    let zip_path = deps.join(format!("node-{}.zip", manifest.version));
+    // 按平台选择归档（新格式 platforms；旧格式顶层字段按 win-x64 兼容）
+    let platform = manifest
+        .platforms
+        .get(&platform_key())
+        .cloned()
+        .unwrap_or_else(|| NodePlatform {
+            archive: format!("node-{}-win-x64.zip", manifest.version),
+            urls: manifest.urls.clone(),
+            sha256: manifest.sha256.clone(),
+        });
+    let archive_path = deps.join(&platform.archive);
     let mut last_error = String::new();
-    for (i, url) in manifest.urls.iter().enumerate() {
-        let label = format!("正在下载 Node.js 运行时 (镜像 {}/{})…", i + 1, manifest.urls.len());
+    for (i, url) in platform.urls.iter().enumerate() {
+        let label = format!("正在下载 Node.js 运行时 (镜像 {}/{})…", i + 1, platform.urls.len());
         send(ProgressState::new("download-node", &label, None, ""));
-        let outcome = download_verified(url, &zip_path, &manifest.sha256, &|written, total| {
+        let outcome = download_verified(url, &archive_path, &platform.sha256, &|written, total| {
             let pct = if total > 0 { Some(((written * 100) / total) as u8) } else { None };
             let detail = format!(
                 "{:.1} MB / {:.1} MB",
@@ -324,7 +412,7 @@ fn ensure_node(
             }
             Err(e) => {
                 last_error = format!("{e}");
-                let _ = std::fs::remove_file(&zip_path);
+                let _ = std::fs::remove_file(&archive_path);
             }
         }
     }
@@ -337,13 +425,16 @@ fn ensure_node(
     let tmp_dir = deps.join("node.tmp");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     create_dir_all(&tmp_dir).map_err(|e| format!("mkdir {}: {e}", tmp_dir.display()))?;
-    extract_node_zip(&zip_path, &tmp_dir)?;
+    #[cfg(windows)]
+    extract_node_zip(&archive_path, &tmp_dir)?;
+    #[cfg(not(windows))]
+    extract_tar_archive(&archive_path, &tmp_dir)?;
     let _ = std::fs::remove_dir_all(&node_dir);
     std::fs::rename(&tmp_dir, &node_dir).map_err(|e| format!("rename node dir: {e}"))?;
-    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&archive_path);
 
     if !node_exe.exists() {
-        return Err("Node.js 解压后 node.exe 缺失".into());
+        return Err(format!("Node.js 解压后 {} 缺失", node_bin_name()));
     }
     Ok(node_exe)
 }
@@ -414,10 +505,13 @@ fn ensure_deps(
         .arg("--no-audit")
         .arg("--no-fund")
         .arg("--loglevel=http")
-        .creation_flags(CREATE_NO_WINDOW)
         .current_dir(win_clean(deps))
         .stdout(Stdio::from(File::create(log_dir.join("npm.out.log")).map_err(|e| e.to_string())?))
         .stderr(Stdio::from(File::create(log_dir.join("npm.err.log")).map_err(|e| e.to_string())?));
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     if let Ok(registry) = std::env::var("DSH_NPM_REGISTRY") {
         if !registry.is_empty() {
             cmd.arg("--registry").arg(registry);
@@ -662,6 +756,9 @@ fn check_updates_async(app: tauri::AppHandle, quiet: bool) {
                     if let Some(state) = app.try_state::<Mutex<TrayState>>() {
                         if let Ok(mut guard) = state.lock() {
                             guard.update_available = Some(latest.clone());
+                            guard.update_url = Some(format!(
+                                "https://github.com/titxue/dsh-desktop/releases/tag/{tag}"
+                            ));
                         }
                     }
                     refresh_tray_menu(&app);
@@ -789,7 +886,6 @@ fn spawn_server(spawn: &ServerSpawn) -> std::io::Result<Child> {
         }
     }
     cmd.current_dir(win_clean(&spawn.deps))
-        .creation_flags(CREATE_NO_WINDOW)
         .stdout(
             File::create(spawn.log_dir.join("server.out.log"))
                 .map(Stdio::from)
@@ -800,6 +896,10 @@ fn spawn_server(spawn: &ServerSpawn) -> std::io::Result<Child> {
                 .map(Stdio::from)
                 .unwrap_or_else(|_| Stdio::null()),
         );
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.spawn()
 }
 
@@ -872,9 +972,20 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
             refresh_tray_menu(app);
         }
         "check-update" => {
-            // 手动检查更新：发现新版直接打开发布页，无新版弹提示
-            let handle = app.clone();
-            check_updates_async(handle, false);
+            // 已有新版信息 → 直接打开发布页；否则执行检查
+            let has_update = if let Some(state) = app.try_state::<Mutex<TrayState>>() {
+                if let Ok(guard) = state.lock() {
+                    guard.update_url.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match has_update {
+                Some(url) => open_url(&url),
+                None => check_updates_async(app.clone(), false),
+            }
         }
         "quit" => {
             // M3 优雅关闭：先通知插件侧清理，等 2s，再强杀兜底退出
@@ -1152,11 +1263,13 @@ pub fn run() {
                 phase: "idle".to_string(),
                 detail: "启动中…".to_string(),
                 update_available: None,
+                update_url: None,
             }));
             let initial_tray = TrayState {
                 phase: "idle".to_string(),
                 detail: "启动中…".to_string(),
                 update_available: None,
+                update_url: None,
             };
             // 启动后自动检查一次更新（后台线程，失败静默）
             check_updates_async(app.handle().clone(), true);

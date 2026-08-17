@@ -43,6 +43,13 @@ jobs:
           npm install --no-audit --no-fund
           npx tsc -p tsconfig.json
 
+      - name: Assemble desktop plugin resources
+        run: |
+          mkdir -p bootstrap/plugin/@titxue/dsh-desktop-host
+          cp plugins/desktop-host/package.json bootstrap/plugin/@titxue/dsh-desktop-host/
+          cp -r plugins/desktop-host/lib bootstrap/plugin/@titxue/dsh-desktop-host/
+          cp plugins/desktop-host/desktop.yml bootstrap/desktop.yml
+
       - name: Tauri build (${{ matrix.bundles }})
         run: bunx tauri build --bundles ${{ matrix.bundles }}
 

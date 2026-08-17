@@ -45,6 +45,7 @@ struct ServerState {
 struct TrayState {
     phase: String, // idle | ready | error | off
     detail: String,
+    update_available: Option<String>, // 有新版时记录版本号
 }
 
 /// 壳侧本地设置（持久化到 app_config_dir/settings.json）。
@@ -519,6 +520,12 @@ fn build_tray_menu(app: &tauri::AppHandle, state: &TrayState) -> tauri::Result<M
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
     let autostart = CheckMenuItem::with_id(app, "autostart", "开机自启", true, autostart_on, None::<&str>)?;
     let minimize = CheckMenuItem::with_id(app, "minimize", "关闭时最小化到托盘", true, settings.minimize_to_tray, None::<&str>)?;
+    // 更新检查：有新版时菜单项显示版本号
+    let update_label = match &state.update_available {
+        Some(v) => format!("发现新版本 v{v}，点击查看"),
+        None => "检查更新…".to_string(),
+    };
+    let check_update = MenuItem::with_id(app, "check-update", update_label, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Menu::with_items(
         app,
@@ -533,6 +540,8 @@ fn build_tray_menu(app: &tauri::AppHandle, state: &TrayState) -> tauri::Result<M
             &PredefinedMenuItem::separator(app)?,
             &autostart,
             &minimize,
+            &PredefinedMenuItem::separator(app)?,
+            &check_update,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -573,6 +582,111 @@ fn set_tray_phase(app: &tauri::AppHandle, phase: &str, detail: &str) {
             }
         }
     }
+}
+
+/// GitHub 最新发布信息（API 响应子集）。
+#[derive(Deserialize)]
+struct ReleaseInfo {
+    tag_name: String,
+    html_url: String,
+}
+
+/// 更新检查结果。
+enum UpdateCheck {
+    Latest(String), // 最新版本号（tag）
+    NoRelease,      // 仓库还没有 release
+    Unavailable,    // 网络/解析失败
+}
+
+/// 查询 GitHub 最新 release（10s 超时，失败不阻塞）。
+fn check_latest_version() -> UpdateCheck {
+    let url = "https://api.github.com/repos/titxue/dsh-desktop/releases/latest";
+    match ureq::get(url)
+        .set("User-Agent", "dsh-desktop")
+        .timeout(Duration::from_secs(10))
+        .call()
+    {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => match serde_json::from_str::<ReleaseInfo>(&body) {
+                Ok(info) => UpdateCheck::Latest(info.tag_name),
+                Err(_) => UpdateCheck::Unavailable,
+            },
+            Err(_) => UpdateCheck::Unavailable,
+        },
+        Err(ureq::Error::Status(404, _)) => UpdateCheck::NoRelease,
+        Err(_) => UpdateCheck::Unavailable,
+    }
+}
+
+/// 简单 semver 比较（忽略 v 前缀）。
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let nums = |s: &str| -> Vec<u64> {
+        s.trim_start_matches('v')
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    };
+    let va = nums(a);
+    let vb = nums(b);
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// 用系统浏览器打开 URL。
+fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("cmd").args(["/c", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
+/// 后台检查更新：自动检查（quiet）静默失败；手动检查（非 quiet）给出反馈，
+/// 发现新版时更新托盘菜单状态，手动触发时直接打开发布页。
+fn check_updates_async(app: tauri::AppHandle, quiet: bool) {
+    std::thread::spawn(move || {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        match check_latest_version() {
+            UpdateCheck::Latest(tag) => {
+                let latest = tag.trim_start_matches('v').to_string();
+                if compare_versions(&latest, &current) == std::cmp::Ordering::Greater {
+                    log_line(&app, &format!("update available: v{latest} > v{current}"));
+                    if let Some(state) = app.try_state::<Mutex<TrayState>>() {
+                        if let Ok(mut guard) = state.lock() {
+                            guard.update_available = Some(latest.clone());
+                        }
+                    }
+                    refresh_tray_menu(&app);
+                    notify(&app, "发现新版本", &format!("DeepSeek Harness v{latest} 已发布，可在托盘菜单中查看。"));
+                    if !quiet {
+                        open_url(&format!("https://github.com/titxue/dsh-desktop/releases/tag/{tag}"));
+                    }
+                } else if !quiet {
+                    notify(&app, "已是最新版本", &format!("当前版本 v{current}"));
+                }
+            }
+            UpdateCheck::NoRelease => {
+                log_line(&app, "no release published yet");
+                if !quiet {
+                    notify(&app, "检查更新", "仓库暂无发布版本。");
+                }
+            }
+            UpdateCheck::Unavailable => {
+                log_line(&app, "update check failed (network)");
+                if !quiet {
+                    notify(&app, "检查更新失败", "无法访问 GitHub，请检查网络后重试。");
+                }
+            }
+        }
+    });
 }
 
 /// 系统通知（桥 notification 事件 / 本地提示）。
@@ -756,6 +870,11 @@ fn handle_tray_menu(app: &tauri::AppHandle, id: &str) {
             settings.minimize_to_tray = !settings.minimize_to_tray;
             save_settings(app, &settings);
             refresh_tray_menu(app);
+        }
+        "check-update" => {
+            // 手动检查更新：发现新版直接打开发布页，无新版弹提示
+            let handle = app.clone();
+            check_updates_async(handle, false);
         }
         "quit" => {
             // M3 优雅关闭：先通知插件侧清理，等 2s，再强杀兜底退出
@@ -1032,11 +1151,15 @@ pub fn run() {
             app.manage(Mutex::new(TrayState {
                 phase: "idle".to_string(),
                 detail: "启动中…".to_string(),
+                update_available: None,
             }));
             let initial_tray = TrayState {
                 phase: "idle".to_string(),
                 detail: "启动中…".to_string(),
+                update_available: None,
             };
+            // 启动后自动检查一次更新（后台线程，失败静默）
+            check_updates_async(app.handle().clone(), true);
             let tray = TrayIconBuilder::with_id("main-tray")
                 .icon(tauri::image::Image::from_bytes(tray_icon_bytes("idle"))?)
                 .menu(&build_tray_menu(app.handle(), &initial_tray)?)

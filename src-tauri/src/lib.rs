@@ -518,6 +518,14 @@ fn ensure_deps(
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    // npm lifecycle 脚本（koffi 等原生包的 postinstall）会直接调用
+    // node，必须把 node 所在目录加进 PATH（macOS/Linux 下 node 在
+    // deps/node/bin，默认不在 PATH 中）。
+    if let Some(dir) = win_clean(node_exe).parent() {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        cmd.env("PATH", format!("{}{}{}", dir.display(), sep, path));
+    }
     if let Ok(registry) = std::env::var("DSH_NPM_REGISTRY") {
         if !registry.is_empty() {
             cmd.arg("--registry").arg(registry);

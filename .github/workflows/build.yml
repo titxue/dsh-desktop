@@ -53,6 +53,12 @@ jobs:
       - name: Tauri build (${{ matrix.bundles }})
         run: bunx tauri build --bundles ${{ matrix.bundles }}
 
+      - name: Ad-hoc sign macOS app and repack dmg
+        if: matrix.os == 'macos-latest'
+        run: |
+          codesign --force --deep --sign - "src-tauri/target/release/bundle/macos/DeepSeek Harness.app"
+          hdiutil create -volname "DeepSeek Harness" -srcfolder "src-tauri/target/release/bundle/macos/DeepSeek Harness.app" -ov -format UDZO "src-tauri/target/release/bundle/dmg/DeepSeek Harness_0.1.0_aarch64.dmg"
+
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:

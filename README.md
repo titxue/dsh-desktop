@@ -66,6 +66,21 @@ bunx tauri build                  # 编译 Rust 并打包 NSIS 安装程序
 产物作为 CI artifact 上传，也可附加到 GitHub Release（`gh release create vX.Y.Z` 后由发布流程上传）。
 Node.js 运行时按平台分发（`bootstrap/node-manifest.json` 的 `platforms` 映射，win-x64 / darwin-arm64 / darwin-x64 / linux-x64，各带 SHA-256 校验）。
 
+## macOS 安装说明（未签名版本）
+
+应用未经过 Apple 公证（需要 Apple 开发者账号），首次从浏览器下载打开会提示"已损坏"或"无法验证开发者"——
+**这是 Gatekeeper 安全拦截，不是文件损坏**。按任一步骤即可使用：
+
+- **右键打开**：在访达中右键应用 →「打开」→ 在弹窗中再点「打开」（之后可正常双击）；
+- **清除隔离标记**（终端）：
+  ```bash
+  xattr -cr "/Applications/DeepSeek Harness.app"
+  ```
+- **本地传输**：通过 AirDrop / U 盘拷贝安装包，不经网络下载可避免隔离标记、直接打开。
+
+安装包已做 ad-hoc 签名（codesign），本地分发可正常运行；彻底消除 Gatekeeper 提示需
+Apple Developer 签名 + 公证（CI 已预留签名步骤，未来配置证书即可自动启用）。
+
 ## 离线变体（打包 node_modules）
 
 编辑 `src-tauri/tauri.conf.json`，将 `bundle.resources` 改为 `["../runtime"]`，然后执行 `bun scripts/setup-runtime.ts --bundle` 组装完整闭包（`node_modules` + `node.exe`）。外壳会从 exe 同级目录或 NSIS 的 `_up_` 暂存目录查找 `runtime`。安装包体积增至约 45 MB，但可完全离线使用。

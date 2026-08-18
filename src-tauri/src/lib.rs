@@ -132,14 +132,16 @@ fn platform_key() -> String {
 }
 
 /// 平台对应的 node 可执行文件名。
-fn node_bin_name() -> &'static str {
+/// 平台对应的 node 可执行文件在 node 目录内的相对路径。
+/// Windows zip 把 node.exe 放根目录；macOS/Linux tar 放 bin/ 子目录。
+fn node_bin_rel() -> &'static str {
     #[cfg(windows)]
     {
         "node.exe"
     }
     #[cfg(not(windows))]
     {
-        "node"
+        "bin/node"
     }
 }
 
@@ -375,7 +377,7 @@ fn ensure_node(
     manifest: &NodeManifest,
     send: &dyn Fn(ProgressState),
 ) -> Result<PathBuf, String> {
-    let node_exe = deps.join("node").join(node_bin_name());
+    let node_exe = deps.join("node").join(node_bin_rel());
     if node_exe.exists() {
         return Ok(node_exe);
     }
@@ -434,7 +436,7 @@ fn ensure_node(
     let _ = std::fs::remove_file(&archive_path);
 
     if !node_exe.exists() {
-        return Err(format!("Node.js 解压后 {} 缺失", node_bin_name()));
+        return Err(format!("Node.js 解压后 {} 缺失", node_bin_rel()));
     }
     Ok(node_exe)
 }
@@ -453,7 +455,11 @@ fn ensure_deps(
     if marker.exists() {
         return Ok(());
     }
+    // npm CLI 位置按平台：Windows zip 在根 node_modules，macOS/Linux tar 在 lib/node_modules
+    #[cfg(windows)]
     let npm_cli = deps.join("node").join("node_modules").join("npm").join("bin").join("npm-cli.js");
+    #[cfg(not(windows))]
+    let npm_cli = deps.join("node").join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js");
     if !npm_cli.exists() {
         return Err(format!("npm CLI missing at {}", npm_cli.display()));
     }
